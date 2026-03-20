@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Suite Pest sur SQLite en mémoire — le job rapide, celui qui doit rester
+  # sous la minute. C'est la configuration par défaut de phpunit.xml.
+  server:
+    name: Serveur (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, bcmath, pdo_sqlite, sqlite3
+          coverage: none
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ hashFiles('server/composer.lock') }}
+          restore-keys: composer-
+
+      - name: Installer les dépendances
+        working-directory: server
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Préparer l'environnement
+        working-directory: server
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Tests
+        working-directory: server
+        run: php artisan test
+
+  # Même suite sur PostgreSQL réel. Le projet maintient phpunit.pgsql.xml
+  # justement parce que SQLite et PostgreSQL ne se comportent pas pareil sur
+  # les enums et les contraintes — sans ce job, cette config ne serait jamais
+  # exécutée automatiquement.
+  server-postgres:
+    name: Serveur (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: school_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: root
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, bcmath, pdo_pgsql
+          coverage: none
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ hashFiles('server/composer.lock') }}
+          restore-keys: composer-
+
+      - name: Installer les dépendances
+        working-directory: server
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Préparer l'environnement
+        working-directory: server
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Tests
+        working-directory: server
+        run: php artisan test --configuration=phpunit.pgsql.xml
+
+  # Pint sur les seuls fichiers touchés par la PR. Le reste du dépôt n'est pas
+  # encore conforme (une centaine de fichiers antérieurs à ce workflow) ; le
+  # normaliser demande un commit de reformatage dédié. En attendant, ce job
+  # garantit qu'aucun nouveau fichier n'aggrave la dette.
+  pint:
+    name: Style PHP (fichiers modifiés)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Installer les dépendances
+        working-directory: server
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Vérifier le style
+        working-directory: server
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          FILES=$(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.php' \
+                  | grep '^server/' | sed 's|^server/||' || true)
+          if [ -z "$FILES" ]; then
+            echo "Aucun fichier PHP modifié."
+            exit 0
+          fi
+          echo "$FILES"
+          vendor/bin/pint --test $FILES
+
+  # admin/ et client/ seulement. frontend/ est exclu : son build échoue sur 14
+  # erreurs de types (contexte d'authentification jamais narrowé, fonctions
+  # sans retour). L'app n'est référencée nulle part et son sort n'est pas
+  # tranché — l'ajouter ici rendrait la CI rouge en permanence. À réintégrer
+  # dans la matrice le jour où elle est réparée, ou à supprimer avec elle.
+  web:
+    name: ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [admin, client]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+
+      - name: Installer les dépendances
+        working-directory: ${{ matrix.app }}
+        run: npm ci
+
+      - name: Lint
+        working-directory: ${{ matrix.app }}
+        run: npm run lint
+
+      # tsc -b puis vite build : c'est tsc qui a laissé passer les imports
+      # morts corrigés dans fix/admin-build.
+      - name: Build
+        working-directory: ${{ matrix.app }}
+        run: npm run build
